@@ -11,6 +11,7 @@ mod database;
 mod dialogs;
 mod dpi;
 mod i18n;
+mod logging;
 mod mini_overlay;
 mod overlay;
 mod telegram;
@@ -20,7 +21,7 @@ use std::mem::zeroed;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{BOOL, GetLastError, CloseHandle, ERROR_ALREADY_EXISTS},
+        Foundation::{BOOL, CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS},
         System::{
             LibraryLoader::GetModuleHandleW,
             Threading::CreateMutexW,
@@ -35,28 +36,38 @@ use constants::MUTEX_NAME;
 use database::{init_database, load_remaining_time, get_current_weekday, get_daily_limit};
 use mini_overlay::{create_mini_overlay, register_mini_overlay_class, show_mini_overlay};
 use overlay::{create_overlay_window, register_overlay_class};
-use tray::{add_tray_icon, remove_tray_icon, window_proc};
+use tray::{add_tray_icon, init_taskbar_created_message, remove_tray_icon, window_proc};
 use std::sync::atomic::Ordering;
 
 fn main() {
     unsafe {
+        // Record unexpected panics before the process aborts. This turns
+        // "the app silently disappears" into a diagnosable event.
+        logging::install_panic_hook();
+        logging::log(&format!(
+            "=== Screen Time Manager v{} starting ===",
+            env!("CARGO_PKG_VERSION")
+        ));
+
         // Set DPI awareness before creating any windows
         let _ = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
         dpi::init_dpi();
 
         // Check for single instance
         if !ensure_single_instance() {
-            MessageBoxW(
-                None,
-                w!("Screen Time Manager is already running."),
-                w!("Already Running"),
-                MB_OK | MB_ICONWARNING,
-            );
+            // Silent exit: at logon both the scheduled task and a Startup
+            // shortcut may launch us at the same time. A modal message box
+            // in that situation is pointless and confusing.
+            logging::log("Another instance is already running; exiting.");
             return;
         }
 
+        // We are the primary instance: a previous intentional stop no longer applies.
+        logging::clear_stopped_marker();
+
         // Initialize database
         if let Err(e) = init_database() {
+            logging::log(&format!("Failed to initialize database: {}", e));
             let msg: Vec<u16> = format!("Failed to initialize database: {}\0", e)
                 .encode_utf16()
                 .collect();
@@ -70,7 +81,19 @@ fn main() {
         }
 
         // Get the module handle
-        let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
+        let hinstance = match GetModuleHandleW(None) {
+            Ok(h) => h,
+            Err(e) => {
+                logging::log(&format!("Failed to get module handle: {}", e));
+                MessageBoxW(
+                    None,
+                    w!("Failed to initialize Screen Time Manager."),
+                    w!("Startup Error"),
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
+        };
 
         // Register main window class
         let class_name = w!("ScreenTimeManagerClass");
@@ -83,7 +106,17 @@ fn main() {
         };
 
         if RegisterClassW(&wnd_class) == 0 {
-            panic!("Failed to register window class");
+            let err = GetLastError();
+            if err != ERROR_CLASS_ALREADY_EXISTS {
+                logging::log(&format!("Failed to register window class: {:?}", err));
+                MessageBoxW(
+                    None,
+                    w!("Failed to initialize Screen Time Manager."),
+                    w!("Startup Error"),
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
         }
 
         // Register overlay and blocking window classes
@@ -92,7 +125,7 @@ fn main() {
         register_mini_overlay_class(hinstance);
 
         // Create a hidden window for message handling
-        let hwnd = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             Default::default(),
             class_name,
             w!("Screen Time Manager"),
@@ -105,8 +138,19 @@ fn main() {
             None,
             hinstance,
             None,
-        )
-        .expect("Failed to create window");
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                logging::log(&format!("Failed to create main window: {}", e));
+                MessageBoxW(
+                    None,
+                    w!("Failed to create the main window."),
+                    w!("Startup Error"),
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
+        };
 
         // Create the overlay windows (initially hidden)
         create_overlay_window(hinstance);
@@ -135,7 +179,10 @@ fn main() {
             blocking::show_blocking_overlay(&msg);
         }
 
-        // Add the system tray icon
+        // Add the system tray icon. This can legitimately fail very early
+        // during logon, before Explorer has created the notification area.
+        // add_tray_icon() arms a retry timer instead of aborting the process.
+        init_taskbar_created_message();
         add_tray_icon(hwnd);
 
         // Start Telegram bot in background thread (if configured)
@@ -147,6 +194,8 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        logging::log("Message loop ended; shutting down.");
 
         // Cleanup: remove the tray icon
         remove_tray_icon();

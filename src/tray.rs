@@ -3,7 +3,7 @@
 
 use std::mem::zeroed;
 use windows::{
-    core::PCWSTR,
+    core::{w, PCWSTR},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
@@ -22,21 +22,62 @@ use crate::constants::*;
 use crate::database::{get_blocking_message, get_warning_config, is_pause_enabled};
 use crate::dialogs::{show_settings_dialog, show_stats_dialog, verify_passcode_for_quit};
 use crate::i18n;
+use crate::logging;
 use crate::mini_overlay::{is_paused, is_idle_paused, can_pause, toggle_pause, PauseBlockedReason, get_remaining_pause_budget};
 use crate::overlay::{show_overlay, OVERLAY_HWND};
 use crate::telegram;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Global state for the notification icon data
 pub static mut NOTIFY_ICON_DATA: Option<NOTIFYICONDATAW> = None;
 
-/// Add the system tray icon
-pub unsafe fn add_tray_icon(hwnd: HWND) {
-    let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
+/// Timer used to retry adding the tray icon until Explorer's notification
+/// area is ready (this is usually only a problem during logon).
+pub const TRAY_RETRY_TIMER_ID: usize = 20;
+const TRAY_RETRY_INTERVAL_MS: u32 = 1500;
 
-    let hicon = LoadIconW(hinstance, PCWSTR(1 as *const u16))
+/// `TaskbarCreated` is broadcast by Explorer when it (re)starts, meaning all
+/// tray icons have to be registered again.
+pub static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
+
+/// Look up the `TaskbarCreated` broadcast message. Must be called before the
+/// message loop starts.
+pub unsafe fn init_taskbar_created_message() {
+    let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+    TASKBAR_CREATED_MESSAGE.store(msg, Ordering::SeqCst);
+}
+
+/// Add the system tray icon.
+///
+/// Returns `false` and arms a retry timer when the shell is not ready yet
+/// (typical during logon). Never panics: a missing tray icon must not take
+/// the whole application down.
+pub unsafe fn add_tray_icon(hwnd: HWND) -> bool {
+    // Drop a stale registration first. NIM_ADD fails if the same icon ID is
+    // already registered (e.g. after an Explorer restart notification), so a
+    // clean delete-before-add makes the retry loop reliable.
+    if let Some(old) = NOTIFY_ICON_DATA.as_ref() {
+        let _ = Shell_NotifyIconW(NIM_DELETE, old);
+        NOTIFY_ICON_DATA = None;
+    }
+
+    let hinstance = match GetModuleHandleW(None) {
+        Ok(h) => h,
+        Err(e) => {
+            logging::log(&format!("Tray: GetModuleHandleW failed: {}", e));
+            return false;
+        }
+    };
+
+    let hicon = match LoadIconW(hinstance, PCWSTR(1 as *const u16))
         .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-        .expect("Failed to load icon");
+    {
+        Ok(icon) => icon,
+        Err(e) => {
+            logging::log(&format!("Tray: failed to load icon: {}", e));
+            return false;
+        }
+    };
 
     let tooltip = i18n::t("tray.tooltip");
     let mut tip_buffer: [u16; 128] = [0; 128];
@@ -55,10 +96,14 @@ pub unsafe fn add_tray_icon(hwnd: HWND) {
     nid.szTip = tip_buffer;
 
     if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-        panic!("Failed to add tray icon");
+        logging::log("Tray: Shell_NotifyIconW(NIM_ADD) failed (shell not ready); retrying in 1.5s");
+        let _ = SetTimer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_INTERVAL_MS, None);
+        return false;
     }
 
     NOTIFY_ICON_DATA = Some(nid);
+    logging::log("Tray: icon added");
+    true
 }
 
 /// Remove the system tray icon
@@ -71,7 +116,13 @@ pub unsafe fn remove_tray_icon() {
 
 /// Show the context menu when right-clicking the tray icon
 pub unsafe fn show_context_menu(hwnd: HWND) {
-    let hmenu = CreatePopupMenu().expect("Failed to create popup menu");
+    let hmenu = match CreatePopupMenu() {
+        Ok(menu) => menu,
+        Err(e) => {
+            logging::log(&format!("Tray: failed to create popup menu: {}", e));
+            return;
+        }
+    };
 
     // Determine pause menu item text and state
     let paused = is_paused();
@@ -130,63 +181,61 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
     show_context_menu_with_pause(hwnd, hmenu, PCWSTR(pause_wide.as_ptr()), pause_flags);
 }
 
+/// Insert a menu item, logging (but ignoring) failures.
+unsafe fn insert_menu(hmenu: HMENU, position: u32, flags: MENU_ITEM_FLAGS, id: usize, text: PCWSTR) {
+    if let Err(e) = InsertMenuW(hmenu, position, flags, id, text) {
+        logging::log(&format!("Tray: InsertMenuW failed at position {}: {}", position, e));
+    }
+}
+
 /// Helper to show context menu with pause item
 unsafe fn show_context_menu_with_pause(hwnd: HWND, hmenu: HMENU, pause_text: PCWSTR, pause_flags: MENU_ITEM_FLAGS) {
     let stats_text = i18n::wide("tray.stats");
-    InsertMenuW(hmenu, 0, MF_BYPOSITION | MF_STRING, IDM_TODAYS_STATS as usize, PCWSTR(stats_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, 0, MF_BYPOSITION | MF_STRING, IDM_TODAYS_STATS as usize, PCWSTR(stats_text.as_ptr()));
     let settings_text = i18n::wide("tray.settings");
-    InsertMenuW(hmenu, 1, MF_BYPOSITION | MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings_text.as_ptr()))
-        .expect("Failed to insert menu item");
-    InsertMenuW(hmenu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_menu(hmenu, 1, MF_BYPOSITION | MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings_text.as_ptr()));
+    insert_menu(hmenu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     let extend15_text = i18n::wide("tray.extend_15");
-    InsertMenuW(hmenu, 3, MF_BYPOSITION | MF_STRING, IDM_EXTEND_15 as usize, PCWSTR(extend15_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, 3, MF_BYPOSITION | MF_STRING, IDM_EXTEND_15 as usize, PCWSTR(extend15_text.as_ptr()));
     let extend45_text = i18n::wide("tray.extend_45");
-    InsertMenuW(hmenu, 4, MF_BYPOSITION | MF_STRING, IDM_EXTEND_45 as usize, PCWSTR(extend45_text.as_ptr()))
-        .expect("Failed to insert menu item");
-    InsertMenuW(hmenu, 5, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_menu(hmenu, 4, MF_BYPOSITION | MF_STRING, IDM_EXTEND_45 as usize, PCWSTR(extend45_text.as_ptr()));
+    insert_menu(hmenu, 5, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
 
     // Pause menu item with dynamic text
-    InsertMenuW(hmenu, 6, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text)
-        .expect("Failed to insert pause menu item");
+    insert_menu(hmenu, 6, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text);
 
     let mut idx = 7;
 
     // Show idle status if idle-paused
     if is_idle_paused() {
         let idle_text = i18n::wide("tray.idle_paused");
-        InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING | MF_GRAYED, 0, PCWSTR(idle_text.as_ptr()))
-            .expect("Failed to insert idle status");
+        insert_menu(hmenu, idx, MF_BYPOSITION | MF_STRING | MF_GRAYED, 0, PCWSTR(idle_text.as_ptr()));
         idx += 1;
     }
 
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     idx += 1;
     let warning_text = i18n::wide("tray.show_warning");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()));
     idx += 1;
     let blocking_text = i18n::wide("tray.show_blocking");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()));
     idx += 1;
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     idx += 1;
     let about_text = i18n::wide("tray.about");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_ABOUT as usize, PCWSTR(about_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_ABOUT as usize, PCWSTR(about_text.as_ptr()));
     idx += 1;
     let quit_text = i18n::wide("tray.quit");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_QUIT as usize, PCWSTR(quit_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_menu(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_QUIT as usize, PCWSTR(quit_text.as_ptr()));
 
     let mut point = zeroed();
-    GetCursorPos(&mut point).expect("Failed to get cursor position");
+    if GetCursorPos(&mut point).is_err() {
+        // Fall back to the position of the message that opened the menu.
+        let pos = GetMessagePos();
+        point.x = (pos & 0xFFFF) as i16 as i32;
+        point.y = ((pos >> 16) & 0xFFFF) as i16 as i32;
+    }
 
     let _ = SetForegroundWindow(hwnd);
 
@@ -210,7 +259,24 @@ pub unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Explorer (re)started: every tray icon has to be registered again.
+    let taskbar_created = TASKBAR_CREATED_MESSAGE.load(Ordering::SeqCst);
+    if taskbar_created != 0 && msg == taskbar_created {
+        logging::log("Tray: Explorer restarted (TaskbarCreated); re-adding icon");
+        remove_tray_icon();
+        add_tray_icon(hwnd);
+        return LRESULT(0);
+    }
+
     match msg {
+        WM_TIMER => {
+            if wparam.0 == TRAY_RETRY_TIMER_ID {
+                let _ = KillTimer(hwnd, TRAY_RETRY_TIMER_ID);
+                add_tray_icon(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_TRAYICON => {
             let event = lparam.0 as u32;
             match event {
@@ -276,6 +342,9 @@ pub unsafe extern "system" fn window_proc(
                 }
                 IDM_QUIT => {
                     if verify_passcode_for_quit(hwnd) {
+                        // Tell the watchdog not to resurrect us after an
+                        // intentional (passcode-protected) quit.
+                        logging::mark_stopped();
                         DestroyWindow(hwnd).ok();
                     }
                 }

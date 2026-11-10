@@ -2076,7 +2076,7 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
     } else {
         // Waiting...
         SetTextColor(hdc, COLORREF(0x00FF9800));
-        let waiting_anim = match (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() % 4) as usize {
+        let waiting_anim = match (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) % 4) as usize {
             0 => "⏳",
             1 => "⌛",
             2 => "⏳",

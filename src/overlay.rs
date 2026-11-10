@@ -43,7 +43,7 @@ pub unsafe fn create_overlay_window(hinstance: windows::Win32::Foundation::HMODU
 
     let ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
 
-    let overlay_hwnd = CreateWindowExW(
+    let overlay_hwnd = match CreateWindowExW(
         ex_style,
         overlay_class_name,
         w!("Screen Time Overlay"),
@@ -56,11 +56,17 @@ pub unsafe fn create_overlay_window(hinstance: windows::Win32::Foundation::HMODU
         None,
         hinstance,
         None,
-    )
-    .expect("Failed to create overlay window");
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(e) => {
+            crate::logging::log(&format!("Overlay: failed to create window: {}", e));
+            return;
+        }
+    };
 
-    SetLayeredWindowAttributes(overlay_hwnd, COLORREF(0), 230, LWA_ALPHA)
-        .expect("Failed to set layered window attributes");
+    if let Err(e) = SetLayeredWindowAttributes(overlay_hwnd, COLORREF(0), 230, LWA_ALPHA) {
+        crate::logging::log(&format!("Overlay: SetLayeredWindowAttributes failed: {}", e));
+    }
 
     OVERLAY_HWND.store(overlay_hwnd.0, Ordering::SeqCst);
 }
@@ -166,6 +172,9 @@ pub unsafe fn register_overlay_class(hinstance: windows::Win32::Foundation::HMOD
     };
 
     if RegisterClassW(&overlay_wnd_class) == 0 {
-        panic!("Failed to register overlay window class");
+        let err = windows::Win32::Foundation::GetLastError();
+        if err != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+            crate::logging::log(&format!("Overlay: failed to register window class: {:?}", err));
+        }
     }
 }

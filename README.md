@@ -153,6 +153,24 @@ The release binary on GitHub is built this exact way, from this exact source, on
 
 ---
 
+## Reliability (build 1.0.41+)
+
+This build focuses on the "app disappears right after logon" crash:
+
+- The tray icon is no longer fatal. If Explorer's notification area is not ready yet, the app keeps running and retries until the icon can be added. It also re-adds the icon when Explorer restarts.
+- **Watchdog:** a second scheduled task (`ScreenTimeManagerWatchdog`) checks once a minute whether the app is running and restarts it if it is not.
+- **Diagnostics:** startup, tray and crash information is written to `%LOCALAPPDATA%\.screen-time-manager\app.log` (watchdog actions go to `watchdog.log`).
+- Quitting from the tray menu (passcode required) writes a `stopped` marker, so the watchdog does not fight an intentional shutdown. The marker is cleared on the next normal launch.
+
+### Building and deploying this build
+
+```
+cargo build --release
+powershell -ExecutionPolicy Bypass -File .\deploy.ps1
+```
+
+`deploy.ps1` self-elevates, replaces the installed executable, refreshes the watchdog script and re-registers both scheduled tasks. It also removes duplicate "Startup" folder shortcuts that would launch a second copy at logon.
+
 ## Requirements
 
 - Windows 10 or Windows 11

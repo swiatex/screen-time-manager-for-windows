@@ -2,11 +2,15 @@
 # Updates the executable and restarts the service
 
 param(
-    [string]$NewExePath = ""
+    [string]$NewExePath = "",
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "ScreenTimeManager"
+$WatchdogTaskName = "ScreenTimeManagerWatchdog"
+$DataDir = Join-Path $env:LOCALAPPDATA ".screen-time-manager"
+$StopMarker = Join-Path $DataDir "stopped"
 
 Write-Host "Screen Time Manager - Update" -ForegroundColor Cyan
 Write-Host "============================" -ForegroundColor Cyan
@@ -58,6 +62,25 @@ $NewExePath = (Resolve-Path $NewExePath).Path
 Write-Host "New executable: $NewExePath" -ForegroundColor Green
 Write-Host ""
 
+# Never silently downgrade: the fix in 1.0.41 must not be replaced by an older
+# upstream release downloaded by this script.
+if (-not $Force -and (Test-Path $currentExePath)) {
+    $installedVersion = (Get-Item $currentExePath).VersionInfo.FileVersion
+    $newVersion = (Get-Item $NewExePath).VersionInfo.FileVersion
+    if ($installedVersion -and $newVersion) {
+        try {
+            if ([version]$newVersion -le [version]$installedVersion) {
+                Write-Host "Refusing to install $newVersion over installed $installedVersion." -ForegroundColor Red
+                Write-Host "This would downgrade the app (and reintroduce the logon crash)." -ForegroundColor Yellow
+                Write-Host "Use -Force if you really want to downgrade." -ForegroundColor Yellow
+                exit 1
+            }
+        } catch {
+            # Unparsable version metadata - continue.
+        }
+    }
+}
+
 # Check if updating in place (same path)
 $updateInPlace = $currentExePath -eq $NewExePath
 if ($updateInPlace) {
@@ -65,8 +88,12 @@ if ($updateInPlace) {
     Write-Host ""
 }
 
-# Stop the scheduled task
+# Stop the watchdog first, then tell it (via the marker) not to resurrect the
+# app while we replace the executable.
 Write-Host "Stopping Screen Time Manager..." -ForegroundColor White
+Stop-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+Set-Content -Path $StopMarker -Value (Get-Date -Format o)
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 # Kill the process if running
@@ -119,6 +146,11 @@ if (-not $updateInPlace) {
             Write-Host "Restoring backup..." -ForegroundColor Yellow
             Copy-Item -Path $backupPath -Destination $currentExePath -Force
         }
+
+        # The old version should keep running: clear the marker and let the
+        # watchdog bring it back.
+        Remove-Item $StopMarker -Force -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
         exit 1
     }
 }
@@ -131,6 +163,7 @@ Write-Host ""
 $response = Read-Host "Do you want to start Screen Time Manager now? (Y/n)"
 if ($response -eq "" -or $response -match "^[Yy]") {
     Write-Host "Starting Screen Time Manager..." -ForegroundColor White
+    Remove-Item $StopMarker -Force -ErrorAction SilentlyContinue
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "Started!" -ForegroundColor Green
 }

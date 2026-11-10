@@ -15,12 +15,26 @@ fn main() {
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let resources = Path::new(&manifest_dir).join("resources");
+    let out_dir = env::var("OUT_DIR").unwrap();
+
+    // Copy the resource inputs into OUT_DIR before handing them to windres.
+    // GNU windres receives paths in the ANSI code page, so a project directory
+    // containing non-ASCII characters (e.g. Polish "ł") makes it fail with
+    // "can't open icon file". OUT_DIR is ASCII-only.
+    let ico_path = Path::new(&out_dir).join("app.ico");
+    let manifest_path = Path::new(&out_dir).join("app.manifest");
+    fs::copy(resources.join("app.ico"), &ico_path)
+        .expect("failed to copy app.ico into OUT_DIR");
+    fs::copy(resources.join("app.manifest"), &manifest_path)
+        .expect("failed to copy app.manifest into OUT_DIR");
 
     // Backslashes in RC string literals are escape characters, so double them.
     let esc = |p: std::path::PathBuf| p.display().to_string().replace('\\', "\\\\");
-    let ico = esc(resources.join("app.ico"));
-    let manifest = esc(resources.join("app.manifest"));
+    let ico = esc(ico_path);
+    let manifest = esc(manifest_path);
 
+    // NOTE: the VarFileInfo/"Translation" block is omitted on purpose. GNU
+    // windres (MinGW) rejects it, and MSVC rc.exe works fine without it.
     let rc = format!(
         "1 ICON \"{ico}\"\n\
          1 24 \"{manifest}\"\n\
@@ -46,14 +60,10 @@ fn main() {
          VALUE \"ProductName\", \"Screen Time Manager\"\n\
          VALUE \"ProductVersion\", \"{version}.0\"\n\
          END\n\
-         BLOCK \"VarFileInfo\"\n\
-         BEGIN\n\
-         VALUE \"Translation\", 0x409, 1200\n\
          END\n\
          END\n",
     );
 
-    let out_dir = env::var("OUT_DIR").unwrap();
     let rc_path = Path::new(&out_dir).join("app.rc");
     fs::write(&rc_path, rc).expect("failed to write generated resource file");
 

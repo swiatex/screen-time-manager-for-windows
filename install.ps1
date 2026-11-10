@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $TaskName = "ScreenTimeManager"
+$WatchdogTaskName = "ScreenTimeManagerWatchdog"
 $Description = "Screen Time Manager - Manages daily computer time limits"
 
 Write-Host "Screen Time Manager - Installation" -ForegroundColor Cyan
@@ -40,21 +41,51 @@ if ($ExePath -eq "" -or -not (Test-Path $ExePath)) {
 }
 
 $ExePath = (Resolve-Path $ExePath).Path
+$InstallDir = Split-Path -Parent $ExePath
 Write-Host "Found executable: $ExePath" -ForegroundColor Green
 Write-Host ""
 
-# Check if task already exists
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existingTask) {
-    Write-Host "Existing installation found. Removing..." -ForegroundColor Yellow
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+# Make sure the watchdog script sits next to the executable.
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$sourceWatchdog = Join-Path $scriptDir "watchdog.ps1"
+$watchdogPath = Join-Path $InstallDir "watchdog.ps1"
+
+if (Test-Path $sourceWatchdog) {
+    if ([IO.Path]::GetFullPath($sourceWatchdog) -ne [IO.Path]::GetFullPath($watchdogPath)) {
+        Copy-Item $sourceWatchdog $watchdogPath -Force
+    }
 }
 
-# Create the scheduled task
+if (-not (Test-Path $watchdogPath)) {
+    Write-Host "WARNING: watchdog.ps1 not found - crash auto-restart will be unavailable." -ForegroundColor Yellow
+}
+
+# Remove duplicate autostart entries (a Startup shortcut would launch a second
+# copy at logon, which is exactly when the app must start reliably).
+$startupDir = [Environment]::GetFolderPath('Startup')
+if ($startupDir -and (Test-Path $startupDir)) {
+    Get-ChildItem $startupDir -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $target = $shell.CreateShortcut($_.FullName).TargetPath
+            if ([IO.Path]::GetFileName($target) -ieq "screen-time-manager.exe") {
+                Remove-Item $_.FullName -Force
+                Write-Host "Removed duplicate Startup shortcut: $($_.Name)" -ForegroundColor Yellow
+            }
+        } catch {
+            # Ignore shortcuts we cannot inspect.
+        }
+    }
+}
+
+# Create the main scheduled task
 Write-Host "Creating scheduled task..." -ForegroundColor White
 
 $action = New-ScheduledTaskAction -Execute $ExePath
 $trigger = New-ScheduledTaskTrigger -AtLogOn
+# Give Explorer a moment to create the notification area. The app also retries
+# on its own, but this avoids the race in the first place.
+$trigger.Delay = "PT20S"
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -65,13 +96,45 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1)
 
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $Description
+Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
 
-Register-ScheduledTask -TaskName $TaskName -InputObject $task | Out-Null
+Write-Host "Main task created." -ForegroundColor Green
+
+# Create the watchdog task (checks once a minute whether the app is alive)
+if (Test-Path $watchdogPath) {
+    Write-Host "Creating watchdog task..." -ForegroundColor White
+
+    $watchdogAction = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchdogPath`""
+
+    # Repeat every minute, starting shortly from now, indefinitely.
+    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $watchdogLogonTrigger = New-ScheduledTaskTrigger -AtLogOn
+    $watchdogLogonTrigger.Delay = "PT30S"
+
+    $watchdogSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+
+    $watchdogTask = New-ScheduledTask -Action $watchdogAction -Trigger @($watchdogTrigger, $watchdogLogonTrigger) `
+        -Principal $principal -Settings $watchdogSettings `
+        -Description "Restarts Screen Time Manager if it is not running"
+
+    Register-ScheduledTask -TaskName $WatchdogTaskName -InputObject $watchdogTask -Force | Out-Null
+    Write-Host "Watchdog task created." -ForegroundColor Green
+}
 
 Write-Host ""
 Write-Host "Installation complete!" -ForegroundColor Green
 Write-Host ""
 Write-Host "Screen Time Manager will now start automatically when you log in." -ForegroundColor White
+Write-Host "If it ever crashes or is killed, the watchdog restarts it within a minute." -ForegroundColor White
 Write-Host ""
 
 # Ask if user wants to start it now

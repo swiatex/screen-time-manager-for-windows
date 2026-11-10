@@ -61,7 +61,7 @@ pub unsafe fn create_mini_overlay(hinstance: windows::Win32::Foundation::HMODULE
 
     let ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
 
-    let hwnd = CreateWindowExW(
+    let hwnd = match CreateWindowExW(
         ex_style,
         class_name,
         w!("Screen Time"),
@@ -74,12 +74,18 @@ pub unsafe fn create_mini_overlay(hinstance: windows::Win32::Foundation::HMODULE
         None,
         hinstance,
         None,
-    )
-    .expect("Failed to create mini overlay window");
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(e) => {
+            crate::logging::log(&format!("MiniOverlay: failed to create window: {}", e));
+            return;
+        }
+    };
 
     // Set transparency (slightly see-through)
-    SetLayeredWindowAttributes(hwnd, COLORREF(0), 200, LWA_ALPHA)
-        .expect("Failed to set layered window attributes");
+    if let Err(e) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 200, LWA_ALPHA) {
+        crate::logging::log(&format!("MiniOverlay: SetLayeredWindowAttributes failed: {}", e));
+    }
 
     MINI_OVERLAY_HWND.store(hwnd.0, Ordering::SeqCst);
 }
@@ -517,6 +523,9 @@ pub unsafe fn register_mini_overlay_class(hinstance: windows::Win32::Foundation:
     };
 
     if RegisterClassW(&wnd_class) == 0 {
-        panic!("Failed to register mini overlay window class");
+        let err = windows::Win32::Foundation::GetLastError();
+        if err != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+            crate::logging::log(&format!("MiniOverlay: failed to register window class: {:?}", err));
+        }
     }
 }

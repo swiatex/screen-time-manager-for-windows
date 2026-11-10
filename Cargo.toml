@@ -1,6 +1,6 @@
 [package]
 name = "screen-time-manager"
-version = "1.0.40"
+version = "1.0.41"
 edition = "2021"
 description = "A screen time management application that runs in the system tray"
 authors = ["Shadow"]
@@ -47,5 +47,5 @@ embed-resource = "2.4"
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
-panic = "abort"     # Abort on panic (smaller binary)
+panic = "unwind"     # Contain panics in background threads instead of killing the app
 strip = true        # Strip symbols

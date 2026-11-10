@@ -124,7 +124,7 @@ pub unsafe fn create_blocking_overlay(hinstance: windows::Win32::Foundation::HMO
     let ex_style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
 
     let window_title = i18n::wide("window.blocking");
-    let hwnd = CreateWindowExW(
+    let hwnd = match CreateWindowExW(
         ex_style,
         class_name,
         PCWSTR(window_title.as_ptr()),
@@ -137,8 +137,13 @@ pub unsafe fn create_blocking_overlay(hinstance: windows::Win32::Foundation::HMO
         None,
         hinstance,
         None,
-    )
-    .expect("Failed to create blocking overlay");
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(e) => {
+            crate::logging::log(&format!("Blocking: failed to create overlay window: {}", e));
+            return;
+        }
+    };
 
     BLOCKING_HWND.store(hwnd.0, Ordering::SeqCst);
 }
@@ -857,7 +862,10 @@ pub unsafe fn register_blocking_class(hinstance: windows::Win32::Foundation::HMO
     };
 
     if RegisterClassW(&blocking_wnd_class) == 0 {
-        panic!("Failed to register blocking overlay window class");
+        let err = windows::Win32::Foundation::GetLastError();
+        if err != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+            crate::logging::log(&format!("Blocking: failed to register window class: {:?}", err));
+        }
     }
 
     // Register secondary overlay class (simpler, no controls)
@@ -873,7 +881,10 @@ pub unsafe fn register_blocking_class(hinstance: windows::Win32::Foundation::HMO
     };
 
     if RegisterClassW(&secondary_wnd_class) == 0 {
-        panic!("Failed to register secondary blocking overlay window class");
+        let err = windows::Win32::Foundation::GetLastError();
+        if err != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+            crate::logging::log(&format!("Blocking: failed to register secondary window class: {:?}", err));
+        }
     }
 }
 
